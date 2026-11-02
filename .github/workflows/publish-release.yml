@@ -1,0 +1,113 @@
+name: publish-release
+
+# Builds a GitHub Release from files that were pushed into this repo as git blobs
+# (or fetched from direct URLs), verifies every byte by sha256, then uploads them
+# as release assets. Triggered by workflow_dispatch only.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag, e.g. v0.5.4"
+        required: true
+      title:
+        description: "Release title"
+        required: true
+      notes:
+        description: "Release notes (markdown)"
+        required: false
+        default: ""
+      prerelease:
+        description: "true for a beta/pre-release"
+        required: false
+        default: "false"
+      draft:
+        description: "true to keep the release as a draft"
+        required: false
+        default: "false"
+      manifest:
+        description: 'JSON array: [{"name":"x.apk","sha256":"...","size":123,"blobs":["<blob sha>",...]}] or {"name","sha256","size","url"}'
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      TAG: ${{ inputs.tag }}
+      TITLE: ${{ inputs.title }}
+      NOTES: ${{ inputs.notes }}
+      PRERELEASE: ${{ inputs.prerelease }}
+      DRAFT: ${{ inputs.draft }}
+      MANIFEST: ${{ inputs.manifest }}
+    steps:
+      - name: Assemble and verify files
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          echo "$MANIFEST" | jq -e 'type=="array" and length>0' >/dev/null
+          n=$(echo "$MANIFEST" | jq 'length')
+          for i in $(seq 0 $((n-1))); do
+            name=$(echo "$MANIFEST" | jq -r ".[$i].name")
+            want_sha=$(echo "$MANIFEST" | jq -r ".[$i].sha256")
+            want_size=$(echo "$MANIFEST" | jq -r ".[$i].size // empty")
+            case "$name" in */*|..*|"") echo "bad name: $name"; exit 1;; esac
+            f="out/$name"; : > "$f"
+            if echo "$MANIFEST" | jq -e ".[$i].blobs" >/dev/null; then
+              for b in $(echo "$MANIFEST" | jq -r ".[$i].blobs[]"); do
+                for try in 1 2 3 4 5; do
+                  if curl -sSfL --retry 3 -H "Authorization: Bearer $GH_TOKEN" \
+                       -H "Accept: application/vnd.github.raw" \
+                       "https://api.github.com/repos/$REPO/git/blobs/$b" -o part.bin; then break; fi
+                  [ "$try" = 5 ] && { echo "blob $b failed"; exit 1; }; sleep $((try*3))
+                done
+                cat part.bin >> "$f"; rm -f part.bin
+              done
+            else
+              url=$(echo "$MANIFEST" | jq -r ".[$i].url")
+              curl -sSfL --retry 5 "$url" -o "$f"
+            fi
+            got_sha=$(sha256sum "$f" | cut -d' ' -f1); got_size=$(stat -c %s "$f")
+            echo "$name size=$got_size sha256=$got_sha"
+            [ "$got_sha" = "$want_sha" ] || { echo "SHA256 MISMATCH for $name (want $want_sha)"; exit 1; }
+            if [ -n "$want_size" ]; then [ "$got_size" = "$want_size" ] || { echo "SIZE MISMATCH for $name"; exit 1; }; fi
+          done
+          ls -l out
+
+      - name: Create or update release and upload assets
+        run: |
+          set -euo pipefail
+          flags=()
+          [ "$PRERELEASE" = "true" ] && flags+=(--prerelease)
+          [ "$DRAFT" = "true" ] && flags+=(--draft)
+          printf '%s' "$NOTES" > notes.md
+          if gh release view "$TAG" -R "$REPO" >/dev/null 2>&1; then
+            echo "release $TAG exists; uploading with --clobber"
+          else
+            gh release create "$TAG" -R "$REPO" --title "$TITLE" --notes-file notes.md --target "${{ github.sha }}" "${flags[@]}"
+          fi
+          gh release upload "$TAG" -R "$REPO" --clobber out/*
+
+      - name: Verify public download URLs
+        if: ${{ inputs.draft != 'true' }}
+        run: |
+          set -euo pipefail
+          n=$(echo "$MANIFEST" | jq 'length')
+          for i in $(seq 0 $((n-1))); do
+            name=$(echo "$MANIFEST" | jq -r ".[$i].name")
+            want_sha=$(echo "$MANIFEST" | jq -r ".[$i].sha256")
+            url="https://github.com/$REPO/releases/download/$TAG/$name"
+            curl -sIL "$url" | grep -iE '^(HTTP|content-type|content-length)'
+            got=$(curl -sSfL "$url" | sha256sum | cut -d' ' -f1)
+            echo "$url -> $got"
+            [ "$got" = "$want_sha" ] || { echo "public download sha mismatch"; exit 1; }
+          done
